@@ -302,7 +302,7 @@ class Controller:
                     self.ring._buf[:n - wrap]
                 ])
         rms = float(np.sqrt(np.mean(samples.astype(np.float32) ** 2)))
-        return min(1.0, rms / 8000.0)
+        return min(1.0, rms / 3000.0)
 
     def peek_audio_wav(self, seconds: float, dest_path: str) -> bool:
         mic = self.mic
@@ -432,61 +432,89 @@ class _MicCapture:
         return devices
 
     def _pick_device_and_rate(self, sd):
-        rates_to_try = [self._req_sr, 48000, 44100, 32000, 16000]
-        
-        # prefer mic over stereo mix
+        # Ordered from most to least preferred: native rate first, then fallbacks.
+        # Returns (device_index, sample_rate, channels).
+        rates_to_try = [44100, 48000, self._req_sr, 32000, 16000]
+        # Remove duplicates while preserving order.
+        seen = set()
+        rates_to_try = [r for r in rates_to_try if not (r in seen or seen.add(r))]
+
+        # --- Pass 1: prefer device 10 (Realtek Mic) at mono ---
         preferred = 10
         for r in rates_to_try:
             try:
                 sd.check_input_settings(device=preferred, channels=1,
                                         samplerate=r, dtype="int16")
-                print(f"[iris] using preferred mic device [{preferred}] @ {r} Hz")
-                return preferred, r
-            except Exception:
-                continue
-            except Exception:
-                pass
+                print(f"[iris] using preferred mic device [{preferred}] @ {r} Hz (mono)")
+                return preferred, r, 1
+            except Exception as e:
+                print(f"[iris] device {preferred} @ {r} Hz mono rejected: {e}")
+
+        # --- Pass 2: enumerate all input devices, try mono then stereo ---
         devices = self._list_input_devices(sd)
         for idx, name, default_sr in devices:
             rates = list(rates_to_try)
             if default_sr and default_sr not in rates:
                 rates.insert(0, default_sr)
-            for r in rates:
-                try:
-                    sd.check_input_settings(
-                        device=idx, channels=1,
-                        samplerate=r, dtype="int16")
-                    print(f"[iris] using input device [{idx}] {name} @ {r} Hz")
-                    return idx, r
-                except Exception:
-                    continue
-        return None, None
+            for ch in (1, 2):  # try mono first, stereo as fallback (e.g. Stereo Mix)
+                for r in rates:
+                    try:
+                        sd.check_input_settings(
+                            device=idx, channels=ch,
+                            samplerate=r, dtype="int16")
+                        ch_label = "mono" if ch == 1 else "stereo"
+                        print(f"[iris] using input device [{idx}] {name} @ {r} Hz ({ch_label})")
+                        return idx, r, ch
+                    except Exception:
+                        continue
+        return None, None, 1
 
     def start(self) -> None:
         import sounddevice as sd
-        device, sr = self._pick_device_and_rate(sd)
+        device, sr, channels = self._pick_device_and_rate(sd)
         if device is None or sr is None:
             raise RuntimeError(
-                "no input device accepted any of 16k/32k/44.1k/48k mono int16 "
-                "— check Windows Sound settings (microphone enabled & not "
-                "exclusive-mode) and that PortAudio sees it (printed above)")
+                "no input device accepted any sample rate — check Windows Sound "
+                "Settings > Privacy > Microphone (must be ON) and that the device "
+                "is not in exclusive mode. Devices printed above.")
         self._sr = sr
+        self._channels = channels
         self._device = device
         self._cap = max(1, int(sr * self._seconds))
         self._buf = np.zeros(self._cap, dtype=np.int16)
         self._widx = 0
         self._count = 0
+        # Use explicit blocksize (not 0) — blocksize=0 can trigger WASAPI
+        # exclusive-mode negotiation that silently prevents the callback firing.
+        # WasapiSettings(exclusive=False) forces shared mode on Windows.
+        wasapi_kwargs = {}
+        try:
+            wasapi_kwargs = {"extra_settings": sd.WasapiSettings(exclusive=False)}
+        except Exception:
+            pass  # Non-Windows or older sounddevice — ignore
         self._stream = sd.InputStream(
             device=device,
-            samplerate=sr, channels=1, dtype="int16",
-            blocksize=0, callback=self._callback,
+            samplerate=sr,
+            channels=channels,
+            dtype="int16",
+            blocksize=2048,
+            callback=self._callback,
+            **wasapi_kwargs,
         )
         self._stream.start()
+        print(f"[iris] stream opened: device={device} sr={sr} ch={channels} blocksize=2048")
 
     def _callback(self, indata, frames, time_info, status):
         try:
-            print(f"[mic] cb frames={frames} status={status}")
-            mono = indata[:, 0] if indata.ndim > 1 else indata.reshape(-1)
+            if status:
+                print(f"[mic] cb status={status}")  # only print on problems
+            # For stereo (e.g. Stereo Mix), average channels down to mono.
+            if indata.ndim > 1 and indata.shape[1] > 1:
+                mono = indata.mean(axis=1).astype(np.int16)
+            elif indata.ndim > 1:
+                mono = indata[:, 0]
+            else:
+                mono = indata.reshape(-1)
             n = len(mono)
             if n == 0:
                 return
@@ -534,7 +562,9 @@ class _MicCapture:
         if s is None:
             return 0.0
         rms = float(np.sqrt(np.mean(s.astype(np.float32) ** 2)))
-        return min(1.0, rms / 8000.0)
+        # int16 speech RMS is typically 300-4000; divisor of 3000 gives a
+        # responsive bar. The old 8000 divisor made speech show as near-zero.
+        return min(1.0, rms / 3000.0)
 
     def peek_wav(self, seconds: float, dest_path: str) -> bool:
         n = int(seconds * self._sr)
