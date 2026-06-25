@@ -234,6 +234,17 @@ class Controller:
         self.file_player = None
 
     def start_mic_capture(self) -> bool:
+        # Option B (default): the ESP32 is the microphone. Its audio already
+        # flows into the ring buffer via WifiReader, so we deliberately do NOT
+        # open a Windows audio device. Leaving self.mic = None makes peek_level()
+        # and peek_audio_wav() read from the ring buffer (the ESP32 stream).
+        # Set USE_PC_MIC = True in config_phase9.py to capture from a local
+        # Windows microphone instead (Option A).
+        use_pc_mic = getattr(config, "USE_PC_MIC", False)
+        if not use_pc_mic:
+            print("[iris] mic capture: using ESP32 ring buffer (USE_PC_MIC=False)")
+            return True
+
         with self._lock:
             if self.mic is not None:
                 return True
@@ -262,7 +273,17 @@ class Controller:
             if self._wake_listener is not None:
                 return True
             try:
-                listener = _WakeWordListener(on_wake=on_wake)
+                # Option B (default): feed wake detection from the ESP32 ring
+                # buffer. Set USE_PC_MIC = True in config to use a Windows mic.
+                use_pc_mic = getattr(config, "USE_PC_MIC", False)
+                if use_pc_mic:
+                    listener = _WakeWordListener(on_wake=on_wake)
+                else:
+                    listener = _WakeWordListener(
+                        on_wake=on_wake,
+                        ring=self.ring,
+                        ring_sample_rate=config.SAMPLE_RATE,
+                    )
                 listener.start()
                 self._wake_listener = listener
                 print("[iris] wake word listener started (hey_jarvis)")
@@ -318,7 +339,11 @@ class Controller:
                 return False
             with self.ring._lock:
                 avail = self.ring._count
+                cap = self.ring._capacity
+                requested = n
                 n = min(n, avail)
+                print(f"[iris] peek: requested={requested} avail={avail} "
+                      f"cap={cap} sr={config.SAMPLE_RATE} -> using={n}")
                 if n <= 0:
                     return False
                 start = (self.ring._write_idx - n) % self.ring._capacity
@@ -330,12 +355,38 @@ class Controller:
                         self.ring._buf[start:],
                         self.ring._buf[:n - wrap],
                     ])
+            samples = samples.astype(np.float32)
+
+            # Diagnostic: print the raw ESP32 audio level so we can tell whether
+            # the signal is just quiet (fixable via gain) or essentially silent
+            # (ESP32 / network problem). Comment out once tuned.
+            _raw_rms = float(np.sqrt(np.mean(samples ** 2))) if samples.size else 0.0
+            _raw_peak = float(np.max(np.abs(samples))) if samples.size else 0.0
+            print(f"[iris] ESP32 audio window: rms={_raw_rms:.0f} peak={_raw_peak:.0f} "
+                  f"n={samples.size}")
+
+            # ESP32 mic audio is often low-gain. Apply adaptive gain so Whisper
+            # gets a healthy signal. Normalize peak toward ~60% of full scale,
+            # but cap the multiplier so we don't blow up pure silence/noise.
+            gain = float(getattr(config, "LIVE_AUDIO_GAIN", 0.0))
+            if gain > 0.0:
+                # fixed manual gain if configured
+                samples = samples * gain
+            else:
+                peak = float(np.max(np.abs(samples))) if samples.size else 0.0
+                if peak > 1.0:
+                    target_peak = 0.6 * 32767.0
+                    auto_gain = min(8.0, target_peak / peak)  # cap at 8x
+                    samples = samples * auto_gain
+
+            samples = np.clip(samples, -32768, 32767).astype(np.int16)
+
             import wave as _wave
             with _wave.open(dest_path, "wb") as wf:
                 wf.setnchannels(1)
                 wf.setsampwidth(2)
                 wf.setframerate(config.SAMPLE_RATE)
-                wf.writeframes(samples.astype(np.int16).tobytes())
+                wf.writeframes(samples.tobytes())
             return True
         except Exception as e:
             print(f"[iris] peek_audio_wav failed: {e}")
@@ -432,41 +483,55 @@ class _MicCapture:
         return devices
 
     def _pick_device_and_rate(self, sd):
-        # Ordered from most to least preferred: native rate first, then fallbacks.
         # Returns (device_index, sample_rate, channels).
+        # Priority: MME input devices first (most compatible on Windows),
+        # then DirectSound, then WASAPI, then anything else.
         rates_to_try = [44100, 48000, self._req_sr, 32000, 16000]
-        # Remove duplicates while preserving order.
         seen = set()
         rates_to_try = [r for r in rates_to_try if not (r in seen or seen.add(r))]
 
-        # --- Pass 1: prefer device 10 (Realtek Mic) at mono ---
-        preferred = 10
-        for r in rates_to_try:
-            try:
-                sd.check_input_settings(device=preferred, channels=1,
-                                        samplerate=r, dtype="int16")
-                print(f"[iris] using preferred mic device [{preferred}] @ {r} Hz (mono)")
-                return preferred, r, 1
-            except Exception as e:
-                print(f"[iris] device {preferred} @ {r} Hz mono rejected: {e}")
+        # Group input devices by host API name priority
+        api_priority = ["MME", "DirectSound", "WASAPI"]
+        try:
+            host_apis = sd.query_hostapis()
+            all_devs = list(enumerate(sd.query_devices()))
+        except Exception as e:
+            print(f"[iris] device enumeration failed: {e}")
+            return None, None, 1
 
-        # --- Pass 2: enumerate all input devices, try mono then stereo ---
-        devices = self._list_input_devices(sd)
-        for idx, name, default_sr in devices:
-            rates = list(rates_to_try)
-            if default_sr and default_sr not in rates:
-                rates.insert(0, default_sr)
-            for ch in (1, 2):  # try mono first, stereo as fallback (e.g. Stereo Mix)
-                for r in rates:
+        def api_rank(hostapi_idx):
+            name = host_apis[hostapi_idx]["name"] if hostapi_idx < len(host_apis) else ""
+            for rank, api in enumerate(api_priority):
+                if api in name:
+                    return rank
+            return len(api_priority)
+
+        # Sort: MME first, mic-named entries before stereo mix within same API
+        input_devs = [
+            (i, d) for i, d in all_devs if d["max_input_channels"] > 0
+        ]
+        input_devs.sort(key=lambda x: (
+            api_rank(x[1]["hostapi"]),
+            0 if "Microphone" in x[1]["name"] else 1,
+        ))
+
+        print(f"[iris] input device search order:")
+        for i, d in input_devs:
+            api_name = host_apis[d["hostapi"]]["name"] if d["hostapi"] < len(host_apis) else "?"
+            print(f"       [{i}] {d['name']} ({api_name})")
+
+        for i, d in input_devs:
+            for ch in (2, 1):  # try stereo first for Stereo Mix, mono as fallback
+                for r in rates_to_try:
                     try:
-                        sd.check_input_settings(
-                            device=idx, channels=ch,
-                            samplerate=r, dtype="int16")
-                        ch_label = "mono" if ch == 1 else "stereo"
-                        print(f"[iris] using input device [{idx}] {name} @ {r} Hz ({ch_label})")
-                        return idx, r, ch
+                        sd.check_input_settings(device=i, channels=ch,
+                                                samplerate=r, dtype="int16")
+                        api_name = host_apis[d["hostapi"]]["name"]
+                        print(f"[iris] selected [{i}] {d['name']} ({api_name}) @ {r} Hz ch={ch}")
+                        return i, r, ch
                     except Exception:
                         continue
+
         return None, None, 1
 
     def start(self) -> None:
@@ -484,14 +549,6 @@ class _MicCapture:
         self._buf = np.zeros(self._cap, dtype=np.int16)
         self._widx = 0
         self._count = 0
-        # Use explicit blocksize (not 0) — blocksize=0 can trigger WASAPI
-        # exclusive-mode negotiation that silently prevents the callback firing.
-        # WasapiSettings(exclusive=False) forces shared mode on Windows.
-        wasapi_kwargs = {}
-        try:
-            wasapi_kwargs = {"extra_settings": sd.WasapiSettings(exclusive=False)}
-        except Exception:
-            pass  # Non-Windows or older sounddevice — ignore
         self._stream = sd.InputStream(
             device=device,
             samplerate=sr,
@@ -499,7 +556,6 @@ class _MicCapture:
             dtype="int16",
             blocksize=2048,
             callback=self._callback,
-            **wasapi_kwargs,
         )
         self._stream.start()
         print(f"[iris] stream opened: device={device} sr={sr} ch={channels} blocksize=2048")
@@ -597,21 +653,24 @@ class _WakeWordListener(threading.Thread):
     THRESHOLD     = 0.5
     INPUT_DEVICE_INDEX = 10  # Realtek HD Audio Mic input — set to None to auto-detect
 
-    def __init__(self, on_wake):
+    def __init__(self, on_wake, ring=None, ring_sample_rate=16000):
         super().__init__(daemon=True, name="WakeWordListener")
         self._on_wake = on_wake
         self._stop_event = threading.Event()
+        # Option B: read ESP32 audio from the ring buffer instead of a Windows
+        # audio device. When ring is provided, run() uses _run_from_ring().
+        self._ring = ring
+        self._ring_sr = int(ring_sample_rate) if ring_sample_rate else 16000
 
     def stop(self) -> None:
         self._stop_event.set()
 
     def run(self) -> None:
         try:
-            import pyaudio
             from openwakeword.model import Model
         except ImportError as e:
-            print(f"[wake] openwakeword/pyaudio not installed: {e}\n"
-                  f"       Run: pip install openwakeword pyaudio onnxruntime")
+            print(f"[wake] openwakeword not installed: {e}\n"
+                  f"       Run: pip install openwakeword onnxruntime")
             return
 
         try:
@@ -619,6 +678,18 @@ class _WakeWordListener(threading.Thread):
                         inference_framework="onnx")
         except Exception as e:
             print(f"[wake] failed to load hey_jarvis model: {e}")
+            return
+
+        # Option B: ESP32 audio comes via the ring buffer.
+        if self._ring is not None:
+            self._run_from_ring(oww)
+            return
+
+        try:
+            import pyaudio
+        except ImportError as e:
+            print(f"[wake] pyaudio not installed: {e}\n"
+                  f"       Run: pip install pyaudio")
             return
 
         pa = pyaudio.PyAudio()
@@ -717,6 +788,68 @@ class _WakeWordListener(threading.Thread):
                 pass
             pa.terminate()
             print("[wake] listener stopped")
+
+    def _run_from_ring(self, oww) -> None:
+        """Option B: poll the ESP32 ring buffer for audio and run wake detection.
+
+        The ring buffer holds int16 mono samples at self._ring_sr. We pull
+        CHUNK_SAMPLES-worth (scaled to the ring's rate), resample to 16 kHz for
+        openWakeWord, and check the score.
+        """
+        ring = self._ring
+        src_sr = self._ring_sr
+        # how many source samples correspond to one 16k chunk of CHUNK_SAMPLES
+        src_chunk = max(1, int(round(self.CHUNK_SAMPLES * src_sr / self.SAMPLE_RATE)))
+        last_read_idx = None
+
+        print(f"[wake] listening for 'hey jarvis' on ESP32 ring buffer "
+              f"@ {src_sr} Hz (chunk={src_chunk})")
+
+        def _grab(n):
+            with ring._lock:
+                if ring._count < n:
+                    return None
+                start = (ring._write_idx - n) % ring._capacity
+                if start + n <= ring._capacity:
+                    return ring._buf[start:start + n].copy()
+                wrap = ring._capacity - start
+                return np.concatenate([ring._buf[start:], ring._buf[:n - wrap]])
+
+        while not self._stop_event.is_set():
+            chunk = _grab(src_chunk)
+            if chunk is None:
+                self._stop_event.wait(timeout=0.02)
+                continue
+
+            audio = chunk.astype(np.float32)
+            if src_sr != self.SAMPLE_RATE:
+                target_len = max(1, int(round(
+                    len(audio) * self.SAMPLE_RATE / src_sr)))
+                idx = np.linspace(0, len(audio) - 1, target_len)
+                audio = np.interp(idx, np.arange(len(audio)), audio)
+            audio = audio.astype(np.int16)
+
+            try:
+                oww.predict(audio)
+            except Exception:
+                self._stop_event.wait(timeout=0.02)
+                continue
+
+            scores = oww.prediction_buffer.get("hey_jarvis", [])
+            if scores and float(scores[-1]) >= self.THRESHOLD:
+                print(f"[wake] 'hey jarvis' detected "
+                      f"(score={float(scores[-1]):.2f})")
+                try:
+                    self._on_wake("hey jarvis")
+                except Exception:
+                    pass
+                self._stop_event.wait(timeout=2.0)
+            else:
+                # pace the loop to roughly the chunk duration so we don't spin
+                self._stop_event.wait(
+                    timeout=self.CHUNK_SAMPLES / self.SAMPLE_RATE * 0.5)
+
+        print("[wake] ring listener stopped")
 
 
 def main() -> int:
