@@ -25,7 +25,7 @@ SAMPLE_DTYPE         = "int16"
 # --- Playback / buffering ---
 BLOCK_SAMPLES        = 512
 PREROLL_SAMPLES      = 1600
-RING_CAPACITY        = 8000
+RING_CAPACITY        = 192000
 
 # --- Recording ---
 RECORDINGS_DIR       = r"C:\audio_stream\recordings"
